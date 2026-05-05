@@ -1,0 +1,334 @@
+package domains
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"math"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/miekg/dns"
+	"github.com/praetorian-inc/redmap/pkg/plugins"
+	"golang.org/x/net/publicsuffix"
+)
+
+// queryDNS performs a DNS query of the specified type against the resolver.
+// Returns the response or error. Caller must check r.Rcode and r.Answer.
+func queryDNS(ctx context.Context, fqdn string, qtype uint16, resolver string) (*dns.Msg, error) {
+	c := &dns.Client{
+		Timeout: 5 * time.Second,
+	}
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(fqdn), qtype)
+	m.RecursionDesired = true
+
+	r, _, err := c.ExchangeContext(ctx, m, resolver)
+	if err != nil {
+		return nil, fmt.Errorf("DNS query %s %s: %w", dns.TypeToString[qtype], fqdn, err)
+	}
+	return r, nil
+}
+
+// normalizeDomain ensures domain is in canonical form:
+// - No trailing dot
+// - Lowercase
+// - Trimmed whitespace
+func normalizeDomain(domain string) string {
+	domain = strings.TrimSpace(domain)
+	domain = strings.TrimSuffix(domain, ".")
+	domain = strings.ToLower(domain)
+	return domain
+}
+
+// matchesDomain returns true if host equals domain or is a subdomain of domain.
+func matchesDomain(host, domain string) bool {
+	host = strings.ToLower(host)
+	domain = strings.ToLower(domain)
+	return host == domain || strings.HasSuffix(host, "."+domain)
+}
+
+// resolveIPs returns the A and AAAA record IPs for an FQDN, or empty if NXDOMAIN.
+// A and AAAA are queried independently so a failure in one does not discard the other.
+func resolveIPs(ctx context.Context, fqdn string, resolver string) ([]string, error) {
+	var ips []string
+	var firstErr error
+
+	r, err := queryDNS(ctx, fqdn, dns.TypeA, resolver)
+	if err != nil {
+		firstErr = err
+	} else if r != nil && r.Rcode == dns.RcodeSuccess {
+		for _, ans := range r.Answer {
+			if a, ok := ans.(*dns.A); ok {
+				ips = append(ips, a.A.String())
+			}
+		}
+	}
+
+	r, err = queryDNS(ctx, fqdn, dns.TypeAAAA, resolver)
+	if err != nil {
+		if firstErr != nil {
+			return nil, firstErr
+		}
+	} else if r != nil && r.Rcode == dns.RcodeSuccess {
+		for _, ans := range r.Answer {
+			if aaaa, ok := ans.(*dns.AAAA); ok {
+				ips = append(ips, aaaa.AAAA.String())
+			}
+		}
+	}
+
+	return ips, nil
+}
+
+const wildcardProbeCount = 3
+
+// detectWildcard probes multiple random subdomains to detect wildcard DNS.
+// Returns the union of IPs observed across all probes (empty if no wildcard).
+func detectWildcard(ctx context.Context, base string, resolver string) map[string]bool {
+	wildcardSet := make(map[string]bool)
+
+	for i := 0; i < wildcardProbeCount; i++ {
+		fqdn := randomHex(16) + "." + base
+		ips, err := resolveIPs(ctx, fqdn, resolver)
+		if err != nil || len(ips) == 0 {
+			continue
+		}
+		for _, ip := range ips {
+			wildcardSet[ip] = true
+		}
+	}
+
+	if len(wildcardSet) == 0 {
+		return nil
+	}
+
+	slog.Info("wildcard detected", "base", base, "ips_count", len(wildcardSet))
+	return wildcardSet
+}
+
+// isWildcardMatch returns true if all resolved IPs match the wildcard IP set.
+func isWildcardMatch(ips []string, wildcardIPs map[string]bool) bool {
+	if len(wildcardIPs) == 0 || len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		if !wildcardIPs[ip] {
+			return false
+		}
+	}
+	return true
+}
+
+// randomHex returns a random hex string of the specified byte length.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// FilterWildcardDomains removes domain findings whose parent zone has wildcard
+// DNS. It extracts the unique parent domain of each finding, probes each parent
+// with multiple random subdomains, and drops all findings under wildcard parents.
+//
+// For example, given findings [admin.dev.example.com, api.dev.example.com,
+// www.example.com], it probes <random>.dev.example.com and <random>.example.com.
+// If dev.example.com is a wildcard, both admin and api findings are dropped,
+// but www.example.com is kept.
+func FilterWildcardDomains(ctx context.Context, findings []plugins.Finding) []plugins.Finding {
+	// Extract unique parent domains from all domain findings.
+	parents := make(map[string]bool)
+	for _, f := range findings {
+		if f.Type != plugins.FindingDomain {
+			continue
+		}
+		parent := extractParent(normalizeDomain(f.Value))
+		if parent != "" {
+			parents[parent] = false
+		}
+	}
+
+	if len(parents) == 0 {
+		return findings
+	}
+
+	// Probe each unique parent for wildcard DNS.
+	wildcardParents := make(map[string]bool)
+	for parent := range parents {
+		if ips := detectWildcard(ctx, parent, dnsDefaultResolver); len(ips) > 0 {
+			slog.Info("wildcard detected, filtering subdomains", "parent", parent)
+			wildcardParents[parent] = true
+		}
+	}
+
+	if len(wildcardParents) == 0 {
+		return findings
+	}
+
+	// Filter findings whose parent is a wildcard zone.
+	result := make([]plugins.Finding, 0, len(findings))
+	for _, f := range findings {
+		if f.Type != plugins.FindingDomain {
+			result = append(result, f)
+			continue
+		}
+		parent := extractParent(normalizeDomain(f.Value))
+		if wildcardParents[parent] {
+			slog.Debug("filtered wildcard domain", "domain", f.Value, "parent", parent)
+			continue
+		}
+		result = append(result, f)
+	}
+
+	return result
+}
+
+// extractParent returns the parent domain of an FQDN by stripping the leftmost label.
+// Returns "" if the result would be a public suffix (TLD) like "com", "co.uk", or
+// "com.au", to avoid probing TLDs for wildcard DNS.
+//
+// e.g., "admin.dev.example.com" → "dev.example.com"
+//
+//	"dev.example.com" → "example.com"
+//	"example.com" → "" (parent "com" is a public suffix)
+//	"sub.co.uk" → "" (parent "co.uk" is a public suffix)
+//	"com" → ""
+func extractParent(fqdn string) string {
+	idx := strings.Index(fqdn, ".")
+	if idx < 0 || idx == len(fqdn)-1 {
+		return ""
+	}
+	parent := fqdn[idx+1:]
+	// Skip if the parent is a public suffix (e.g., "com", "co.uk", "com.au").
+	// EffectiveTLDPlusOne returns an error for public suffixes themselves.
+	if _, err := publicsuffix.EffectiveTLDPlusOne(parent); err != nil {
+		return ""
+	}
+	return parent
+}
+
+// knownOOBPatterns contains substrings found in common out-of-band interaction
+// and canary token domain names. Domains containing these should not be permuted.
+var knownOOBPatterns = []string{
+	"oob.",
+	"interact.",
+	"interactsh.",
+	"burpcollaborator",
+	"canarytokens",
+	"dnslog.",
+	"bxss.",
+	"ceye.",
+	"pingb.",
+	"oast.",
+}
+
+const (
+	// maxLabelLength is the threshold above which a DNS label is considered junk.
+	// Real subdomain labels rarely exceed this length.
+	maxLabelLength = 40
+
+	// entropyThreshold is the Shannon entropy above which a label is likely random.
+	// Normal hostnames (e.g., "staging", "api-v2") have entropy well below this.
+	// Random tokens (e.g., "jvoind698msu93mkf5na9l2igbihsccp5d1buy") exceed it.
+	entropyThreshold = 3.5
+
+	// minEntropyLength is the minimum label length for entropy checking.
+	// Short labels can have high entropy without being random (e.g., "xyz").
+	minEntropyLength = 10
+)
+
+// shannonEntropy calculates the Shannon entropy of a string in bits per character.
+func shannonEntropy(s string) float64 {
+	if len(s) == 0 {
+		return 0
+	}
+	freq := make(map[rune]float64)
+	for _, c := range s {
+		freq[c]++
+	}
+	length := float64(len(s))
+	var entropy float64
+	for _, count := range freq {
+		p := count / length
+		if p > 0 {
+			entropy -= p * math.Log2(p)
+		}
+	}
+	return entropy
+}
+
+// isJunkLabel returns true if a DNS label looks like a random token or canary
+// string that should not be permuted.
+func isJunkLabel(label string) bool {
+	if len(label) > maxLabelLength {
+		return true
+	}
+	if len(label) >= minEntropyLength && shannonEntropy(label) > entropyThreshold {
+		return true
+	}
+	return false
+}
+
+// containsOOBPattern returns true if the FQDN contains a known OOB/canary pattern.
+func containsOOBPattern(fqdn string) bool {
+	lower := strings.ToLower(fqdn)
+	for _, pattern := range knownOOBPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// FilterJunkDomains removes domains that contain high-entropy labels or known
+// OOB/canary patterns. This prevents permutation of random tokens and interaction
+// server domains that would generate thousands of bogus assets.
+func FilterJunkDomains(domains []string) []string {
+	result := make([]string, 0, len(domains))
+	for _, d := range domains {
+		d = normalizeDomain(d)
+		if containsOOBPattern(d) {
+			slog.Info("filtered OOB/canary domain", "domain", d)
+			continue
+		}
+		base := guessBaseDomain(d)
+		labels := extractLabels(d, base)
+		junk := false
+		for _, label := range labels {
+			if isJunkLabel(label) {
+				slog.Info("filtered high-entropy domain", "domain", d, "label", label)
+				junk = true
+				break
+			}
+		}
+		if !junk {
+			result = append(result, d)
+		}
+	}
+	return result
+}
+
+// isDomainName returns true when s looks like a domain name rather than
+// an IP address or CIDR block. It is intentionally lenient — the DNS
+// layer will reject truly invalid names.
+func isDomainName(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Reject CIDR notation (e.g. "10.0.0.0/8")
+	if strings.Contains(s, "/") {
+		return false
+	}
+	// Reject plain IPv4/IPv6 (net.ParseIP succeeds)
+	if net.ParseIP(s) != nil {
+		return false
+	}
+	// Reject bracketed IPv6 like "[::1]"
+	if net.ParseIP(strings.Trim(s, "[]")) != nil {
+		return false
+	}
+	return true
+}
