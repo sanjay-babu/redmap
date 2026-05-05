@@ -497,7 +497,7 @@ redmap run --org "Acme Corp" --plugins whois,arin
 
 ## Contributing
 
-We welcome contributions. To add a new plugin:
+To add a new plugin:
 
 1. Create the plugin file in the appropriate package (`domains/` or `cidrs/`)
 2. Implement the `Plugin` interface - 7 methods required
